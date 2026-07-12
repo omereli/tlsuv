@@ -63,13 +63,22 @@ struct conn_req_s {
     int count;
 
     int error;
+
+    uv_timer_t timeout;
+    bool timeout_active;
 };
 
 static tlsuv_connector_req direct_connect(uv_loop_t *loop, const tlsuv_connector_t *self,
                                           const char *host, const char *port, tlsuv_connect_cb cb, void *ctx);
+static tlsuv_connector_req direct_connect_timeout(uv_loop_t *loop, const tlsuv_connector_t *self,
+                                                  const char *host, const char *port, uint64_t timeout_ms,
+                                                  tlsuv_connect_cb cb, void *ctx);
 static void direct_cancel(tlsuv_connector_req req);
 static tlsuv_connector_req proxy_connect(uv_loop_t *l, const tlsuv_connector_t *self,
                                          const char *host, const char *port, tlsuv_connect_cb cb, void *ctx);
+static tlsuv_connector_req proxy_connect_timeout(uv_loop_t *l, const tlsuv_connector_t *self,
+                                                 const char *host, const char *port, uint64_t timeout_ms,
+                                                 tlsuv_connect_cb cb, void *ctx);
 static void proxy_cancel(tlsuv_connector_req req);
 
 // prevent freeing default connector
@@ -86,6 +95,7 @@ static tlsuv_connector_t direct_connector = {
         .set_auth = direct_set_auth,
         .cancel = direct_cancel,
         .free = direct_connector_free,
+        .connect_timeout = direct_connect_timeout,
 };
 
 static const tlsuv_connector_t *global_connector;
@@ -95,7 +105,8 @@ struct tlsuv_proxy_connector_s {
     int (*set_auth)(tlsuv_connector_t *self, tlsuv_auth_t auth, const char *username, const char *password);
     void (*cancel)(tlsuv_connector_req);
     void (*free)(tlsuv_connector_t *self);
-    
+    tlsuv_connect_timeout connect_timeout;
+
     tlsuv_proxy_t type;
     char *host;
     char *port;
@@ -148,7 +159,18 @@ const tlsuv_connector_t* tlsuv_global_connector() {
     return global_connector;
 }
 
+static void on_timeout_closed(uv_handle_t *h) {
+    struct conn_req_s *cr = container_of((uv_timer_t *) h, struct conn_req_s, timeout);
+    tlsuv__free(cr);
+}
+
 static void free_conn_req(struct conn_req_s *cr) {
+    if (cr->timeout_active) {
+        cr->timeout_active = false;
+        uv_timer_stop(&cr->timeout);
+        uv_close((uv_handle_t *) &cr->timeout, on_timeout_closed);
+        return;
+    }
     tlsuv__free(cr);
 }
 
@@ -262,10 +284,10 @@ static void on_connect_poll(uv_poll_t *p, int status, int events) {
 static void on_resolve(uv_getaddrinfo_t *r, int status, struct addrinfo *addrlist) {
     struct conn_req_s *cr = container_of(r, struct conn_req_s, resolve);
 
-    if (status == UV_EAI_CANCELED) {
-        status = UV_ECANCELED;
-    } else if (cr->error != 0) {
+    if (cr->error != 0) {
         status = cr->error;
+    } else if (status == UV_EAI_CANCELED) {
+        status = UV_ECANCELED;
     } else if (addrlist == NULL) {
         status = UV_EAI_NONAME;
     }
@@ -318,22 +340,47 @@ static void on_resolve(uv_getaddrinfo_t *r, int status, struct addrinfo *addrlis
     }
 }
 
-tlsuv_connector_req direct_connect(uv_loop_t *loop, const tlsuv_connector_t *self,
-                                   const char *host, const char *port,
-                                   tlsuv_connect_cb cb, void *ctx) {
+static void on_connect_timeout(uv_timer_t *t) {
+    struct conn_req_s *cr = container_of(t, struct conn_req_s, timeout);
+    if (cr->cb == NULL) {
+        return;
+    }
+    CR_LOG(TRACE, "connect timed out");
+    cr->error = UV_ETIMEDOUT;
+    uv_cancel((uv_req_t *) &cr->resolve);
+    for (int i = 0; i < cr->count; i++) {
+        close_poll_handle(cr, (uv_handle_t *) &cr->polls[i]);
+    }
+}
+
+tlsuv_connector_req direct_connect_timeout(uv_loop_t *loop, const tlsuv_connector_t *self,
+                                           const char *host, const char *port, uint64_t timeout_ms,
+                                           tlsuv_connect_cb cb, void *ctx) {
     assert(cb != NULL);
     struct conn_req_s *cr = tlsuv__calloc(1, sizeof(*cr));
     cr->ctx = ctx;
     cr->cb = cb;
 
+    if (timeout_ms > 0) {
+        uv_timer_init(loop, &cr->timeout);
+        cr->timeout_active = true;
+        uv_timer_start(&cr->timeout, on_connect_timeout, timeout_ms, 0);
+    }
+
     struct addrinfo hints = {
             .ai_socktype = SOCK_STREAM,
     };
-    CR_LOG(TRACE, "connecting to %s:%s", host, port);
+    CR_LOG(TRACE, "connecting to %s:%s (timeout=%llums)", host, port, (unsigned long long) timeout_ms);
 
     uv_getaddrinfo(loop, &cr->resolve, on_resolve, host, port, &hints);
 
     return cr;
+}
+
+tlsuv_connector_req direct_connect(uv_loop_t *loop, const tlsuv_connector_t *self,
+                                   const char *host, const char *port,
+                                   tlsuv_connect_cb cb, void *ctx) {
+    return direct_connect_timeout(loop, self, host, port, 0, cb, ctx);
 }
 
 void direct_cancel(tlsuv_connector_req req) {
@@ -458,8 +505,9 @@ static void on_proxy_connect(uv_os_sock_t fd, int status, void *req) {
     }
 }
 
-tlsuv_connector_req proxy_connect(uv_loop_t *loop, const tlsuv_connector_t *self,
-                                  const char *host, const char *port, tlsuv_connect_cb cb, void *ctx) {
+tlsuv_connector_req proxy_connect_timeout(uv_loop_t *loop, const tlsuv_connector_t *self,
+                                          const char *host, const char *port, uint64_t timeout_ms,
+                                          tlsuv_connect_cb cb, void *ctx) {
 
     assert(loop);
     assert(self);
@@ -474,8 +522,14 @@ tlsuv_connector_req proxy_connect(uv_loop_t *loop, const tlsuv_connector_t *self
     r->host = tlsuv__strdup(host);
     r->port = tlsuv__strdup(port);
     r->work.loop = loop;
-    r->conn_req = direct_connect(loop, &direct_connector, proxy->host, proxy->port, on_proxy_connect, r);
+    r->conn_req = direct_connect_timeout(loop, &direct_connector, proxy->host, proxy->port,
+                                         timeout_ms, on_proxy_connect, r);
     return r;
+}
+
+tlsuv_connector_req proxy_connect(uv_loop_t *loop, const tlsuv_connector_t *self,
+                                  const char *host, const char *port, tlsuv_connect_cb cb, void *ctx) {
+    return proxy_connect_timeout(loop, self, host, port, 0, cb, ctx);
 }
 
 int proxy_set_auth(tlsuv_connector_t *self, tlsuv_auth_t auth, const char *username, const char *password) {
@@ -543,6 +597,7 @@ static void init_proxy_connector(struct tlsuv_proxy_connector_s *c, tlsuv_proxy_
     c->cancel = proxy_cancel;
     c->set_auth = proxy_set_auth;
     c->free = proxy_free;
+    c->connect_timeout = proxy_connect_timeout;
 }
 
 
