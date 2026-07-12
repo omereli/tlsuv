@@ -39,6 +39,10 @@ typedef tlsuv_connector_req (*tlsuv_connect)(uv_loop_t *loop, const tlsuv_connec
                                              const char *host, const char *port,
                                              tlsuv_connect_cb cb, void *ctx);
 
+typedef tlsuv_connector_req (*tlsuv_connect_timeout)(uv_loop_t *loop, const tlsuv_connector_t *connector,
+                                                     const char *host, const char *port, uint64_t timeout_ms,
+                                                     tlsuv_connect_cb cb, void *ctx);
+
 extern void tlsuv_set_global_connector(const tlsuv_connector_t* connector);
 const tlsuv_connector_t *tlsuv_global_connector();
 
@@ -50,6 +54,7 @@ struct tlsuv_connector_s {
     int (*set_auth)(tlsuv_connector_t *self, tlsuv_auth_t auth, const char *username, const char *password);
     void (*cancel)(tlsuv_connector_req);
     void (*free)(void *self);
+    tlsuv_connect_timeout connect_timeout;
 };
 
 
